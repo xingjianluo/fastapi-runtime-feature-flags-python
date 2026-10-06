@@ -10,6 +10,8 @@ class RejectReason(str, Enum):
     MISSING_REQUIRED = "missing_required"  # 必填缺失
     UNKNOWN_KEY = "unknown_key"          # 未知项
     INVALID_VALUE = "invalid_value"      # 值域不合法（如百分比越界）
+    DEPENDENCY_CYCLE = "dependency_cycle"    # 开关依赖关系成环
+    RELATION_CONFLICT = "relation_conflict"  # 互斥组内冲突（并列优先级/组内依赖）
 
 
 @dataclass(frozen=True)

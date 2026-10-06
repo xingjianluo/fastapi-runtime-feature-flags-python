@@ -56,12 +56,19 @@ def _validate_entries(
     report: RejectionReport,
     schema: tuple[ConfigField, ...],
 ) -> dict[str, Any]:
-    """校验一个来源的键值：未知项与类型错误记入 report，返回合法子集。"""
+    """校验一个来源的键值：未知项与类型错误记入 report，返回合法子集。
+
+    None 视为"显式清除"：不参与类型检查，原样透传给合并层，
+    由合并层决定是回退默认还是判必填缺失。
+    """
     valid: dict[str, Any] = {}
     for key, value in values.items():
         field = next((f for f in schema if f.name == key), None)
         if field is None:
             report.add(source, key, RejectReason.UNKNOWN_KEY, "未在 schema 中声明")
+            continue
+        if value is None:
+            valid[key] = None
             continue
         if not check_type(value, field.type):
             report.add(
@@ -89,7 +96,21 @@ def load_file_source(
     if not isinstance(data, dict):
         report.add(source, "<file>", RejectReason.TYPE_MISMATCH, "配置文件顶层必须是 JSON 对象")
         return {}
-    return _validate_entries(data, source, report, schema)
+    # 未知键在此拒绝并丢弃；已知键（含类型不合法者）原样透传，
+    # 由 merge_config 统一裁决，保证"加载期拒绝"与"合并期拒绝"结论一致。
+    values: dict[str, Any] = {}
+    for key, value in data.items():
+        field = next((f for f in schema if f.name == key), None)
+        if field is None:
+            report.add(source, key, RejectReason.UNKNOWN_KEY, "未在 schema 中声明")
+            continue
+        if value is not None and not check_type(value, field.type):
+            report.add(
+                source, key, RejectReason.TYPE_MISMATCH,
+                f"期望 {field.type.value}，实际 {type(value).__name__}",
+            )
+        values[key] = value
+    return values
 
 
 def load_env_source(

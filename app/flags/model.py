@@ -41,6 +41,10 @@ class Flag:
     default: Any = None
     rules: tuple[Rule, ...] = ()
     sensitive: bool = False
+    # 组合关系（缺省为空，等价于旧的独立开关语义）：
+    depends_on: tuple[str, ...] = ()   # 依赖的开关名：依赖未满足时本开关强制关闭
+    mutex_group: str | None = None     # 互斥组名：同组同一时刻最多一个生效
+    priority: int = 0                  # 互斥组内优先级，大者生效；同组不允许并列
 
 
 @dataclass(frozen=True)
