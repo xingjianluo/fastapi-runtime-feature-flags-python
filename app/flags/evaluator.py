@@ -10,9 +10,12 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.flags.model import Condition, Flag, FlagSet, Operator, Rule
+
+if TYPE_CHECKING:
+    from app.runtime.overrides import OverrideManager
 
 
 class DecisionKind(str, Enum):
@@ -23,6 +26,7 @@ class DecisionKind(str, Enum):
     RULE_CONFLICT = "rule_conflict"  # 多条规则命中且取值不一致
     DEPENDENCY_UNSATISFIED = "dependency_unsatisfied"  # 依赖的开关未生效
     GROUP_EXCLUDED = "group_excluded"  # 互斥组内其他开关生效，本开关被排除
+    OVERRIDE = "override"            # 临时覆盖生效中，强制取值
 
 
 @dataclass(frozen=True)
@@ -79,7 +83,7 @@ def _match_rule(flag: Flag, rule: Rule, context: dict[str, Any], bucketing_key: 
     return _bucket(flag.name, rule.name, bucketing_key) < rule.percentage
 
 
-_ACTIVE_KINDS = frozenset({DecisionKind.RULE_MATCH, DecisionKind.DEFAULT})
+_ACTIVE_KINDS = frozenset({DecisionKind.RULE_MATCH, DecisionKind.DEFAULT, DecisionKind.OVERRIDE})
 
 
 def _evaluate_rules(flag_set: FlagSet, flag: Flag, context: dict[str, Any]) -> Decision:
@@ -113,6 +117,7 @@ def _evaluate_own(
     own_memo: dict[str, Decision],
     final_memo: dict[str, Decision],
     in_progress: set[str],
+    overrides: OverrideManager | None,
 ) -> Decision:
     """开关自身的判定（缺失/关闭/依赖/规则），不做互斥组裁决。"""
     if name in own_memo:
@@ -127,7 +132,8 @@ def _evaluate_own(
     else:
         unsatisfied = None
         for dep in sorted(set(flag.depends_on)):
-            dep_decision = _evaluate_final(flag_set, dep, context, own_memo, final_memo, in_progress)
+            dep_decision = _evaluate_final(flag_set, dep, context, own_memo, final_memo,
+                                           in_progress, overrides)
             if not _is_active(dep_decision):
                 unsatisfied = dep
                 break
@@ -148,8 +154,9 @@ def _evaluate_final(
     own_memo: dict[str, Decision],
     final_memo: dict[str, Decision],
     in_progress: set[str],
+    overrides: OverrideManager | None,
 ) -> Decision:
-    """完整判定 = 自身判定 + 互斥组裁决（同组生效者中名字最小者胜出）。"""
+    """完整判定 = 临时覆盖（最高优先级）> 自身判定 + 互斥组裁决。"""
     if name in final_memo:
         return final_memo[name]
     if name in in_progress:
@@ -157,13 +164,25 @@ def _evaluate_final(
         return Decision(flag=name, kind=DecisionKind.DEPENDENCY_UNSATISFIED, value=None,
                         reason="依赖关系成环", version=flag_set.version)
     in_progress.add(name)
-    own = _evaluate_own(flag_set, name, context, own_memo, final_memo, in_progress)
-    decision = own
     flag = flag_set.flags.get(name)
+    if flag is not None and overrides is not None:
+        override = overrides.get(name)
+        if override is not None:
+            decision = Decision(
+                flag=name, kind=DecisionKind.OVERRIDE, value=override.value,
+                reason=f"临时覆盖生效中（{override.actor} 设置，到期时间 {override.expires_at}）",
+                version=flag_set.version,
+            )
+            in_progress.discard(name)
+            final_memo[name] = decision
+            return decision
+    own = _evaluate_own(flag_set, name, context, own_memo, final_memo, in_progress, overrides)
+    decision = own
     if flag is not None and flag.exclusive_group and _is_active(own):
         members = flag_set.group_index.get(flag.exclusive_group, ())
         active = [m for m in members
-                  if _is_active(_evaluate_own(flag_set, m, context, own_memo, final_memo, in_progress))]
+                  if _is_active(_evaluate_own(flag_set, m, context, own_memo, final_memo,
+                                              in_progress, overrides))]
         winner = min(active) if active else name
         if winner != name:
             decision = Decision(
@@ -176,6 +195,7 @@ def _evaluate_final(
     return decision
 
 
-def evaluate(flag_set: FlagSet, name: str, context: dict[str, Any]) -> Decision:
-    """对单个开关求值：规则按声明顺序匹配，结论与声明顺序、并发交错无关。"""
-    return _evaluate_final(flag_set, name, context, {}, {}, set())
+def evaluate(flag_set: FlagSet, name: str, context: dict[str, Any],
+             overrides: OverrideManager | None = None) -> Decision:
+    """对单个开关求值：覆盖 > 关闭/依赖/规则 > 互斥裁决，结论与声明顺序、并发交错无关。"""
+    return _evaluate_final(flag_set, name, context, {}, {}, set(), overrides)
