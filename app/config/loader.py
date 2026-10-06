@@ -1,7 +1,8 @@
 """多来源配置加载与合并：defaults < file < env，优先级确定。
 
-任何类型不合法、必填缺失或未知项都会记录为 ConfigRejection，
-合并结果整体拒绝（返回 None），绝不静默使用兜底值。
+任何类型不合法、必填缺失都会记录为 ConfigRejection 并导致整体拒绝
+（返回 None），绝不静默使用兜底值；未知项仅记录并丢弃该键，不阻断合并。
+显式 null 视为“清空该值”参与合并，必填项被清空会触发 MISSING_REQUIRED。
 """
 from __future__ import annotations
 
@@ -63,6 +64,10 @@ def _validate_entries(
         if field is None:
             report.add(source, key, RejectReason.UNKNOWN_KEY, "未在 schema 中声明")
             continue
+        if value is None:
+            # 显式 null：视为“清空该值”，不参与类型检查，由必填校验兜底
+            valid[key] = None
+            continue
         if not check_type(value, field.type):
             report.add(
                 source, key, RejectReason.TYPE_MISMATCH,
@@ -78,7 +83,11 @@ def load_file_source(
     report: RejectionReport,
     schema: tuple[ConfigField, ...] = SCHEMA,
 ) -> dict[str, Any]:
-    """从 JSON 配置文件加载并校验；文件本身非法时整体拒绝该来源。"""
+    """从 JSON 配置文件加载；文件本身非法时整体拒绝该来源。
+
+    返回文件中的原始条目（含类型不合法项），由 merge_config 做权威校验；
+    加载期同步把问题记录进 report，便于定位来源。
+    """
     source = f"file:{path}"
     try:
         with open(path, encoding="utf-8") as fh:
@@ -89,7 +98,8 @@ def load_file_source(
     if not isinstance(data, dict):
         report.add(source, "<file>", RejectReason.TYPE_MISMATCH, "配置文件顶层必须是 JSON 对象")
         return {}
-    return _validate_entries(data, source, report, schema)
+    _validate_entries(data, source, report, schema)
+    return data
 
 
 def load_env_source(
@@ -131,7 +141,8 @@ def merge_config(
 ) -> tuple[dict[str, Any] | None, RejectionReport]:
     """合并 defaults < file < env。
 
-    返回 (config, report)：report 非空时 config 为 None（整体拒绝）。
+    返回 (config, report)：report 含致命拒绝（类型错误/必填缺失/值域非法）
+    时 config 为 None（整体拒绝）；未知键仅记录并丢弃，不阻断合并。
     prior_report 可传入加载期已收集的拒绝记录，一并计入结论。
     """
     report = RejectionReport()
@@ -143,7 +154,7 @@ def merge_config(
     for f in schema:
         if f.required and merged.get(f.name) is None:
             report.add("merged", f.name, RejectReason.MISSING_REQUIRED, "必填项在所有来源中均缺失")
-    if not report.ok:
+    if report.has_fatal:
         return None, report
     return merged, report
 
