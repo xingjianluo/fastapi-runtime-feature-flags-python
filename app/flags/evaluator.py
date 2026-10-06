@@ -21,6 +21,8 @@ class DecisionKind(str, Enum):
     FLAG_DISABLED = "flag_disabled"  # 开关关闭
     FLAG_MISSING = "flag_missing"    # 开关不存在
     RULE_CONFLICT = "rule_conflict"  # 多条规则命中且取值不一致
+    DEPENDENCY_UNSATISFIED = "dependency_unsatisfied"  # 依赖的开关未生效
+    GROUP_EXCLUDED = "group_excluded"  # 互斥组内其他开关生效，本开关被排除
 
 
 @dataclass(frozen=True)
@@ -77,29 +79,103 @@ def _match_rule(flag: Flag, rule: Rule, context: dict[str, Any], bucketing_key: 
     return _bucket(flag.name, rule.name, bucketing_key) < rule.percentage
 
 
-def evaluate(flag_set: FlagSet, name: str, context: dict[str, Any]) -> Decision:
-    """对单个开关求值：规则按声明顺序匹配，结论与声明顺序、并发交错无关。"""
-    flag = flag_set.flags.get(name)
-    if flag is None:
-        return Decision(flag=name, kind=DecisionKind.FLAG_MISSING, value=None,
-                        reason=f"开关 {name!r} 不存在", version=flag_set.version)
-    if not flag.enabled:
-        return Decision(flag=name, kind=DecisionKind.FLAG_DISABLED, value=flag.default,
-                        reason="开关已关闭，返回默认值", version=flag_set.version)
+_ACTIVE_KINDS = frozenset({DecisionKind.RULE_MATCH, DecisionKind.DEFAULT})
 
+
+def _evaluate_rules(flag_set: FlagSet, flag: Flag, context: dict[str, Any]) -> Decision:
+    """规则求值：按声明顺序匹配，多规则取值冲突时确定性地回退默认值。"""
     bucketing_key = _bucket_key(context)
     matched = [r for r in flag.rules if _match_rule(flag, r, context, bucketing_key)]
     if not matched:
-        return Decision(flag=name, kind=DecisionKind.DEFAULT, value=flag.default,
+        return Decision(flag=flag.name, kind=DecisionKind.DEFAULT, value=flag.default,
                         reason="未命中任何规则，返回默认值", version=flag_set.version)
-
     values = {r.value for r in matched}
     if len(values) > 1:
         names = ", ".join(r.name for r in matched)
-        return Decision(flag=name, kind=DecisionKind.RULE_CONFLICT, value=flag.default,
+        return Decision(flag=flag.name, kind=DecisionKind.RULE_CONFLICT, value=flag.default,
                         reason=f"多条规则命中且取值不一致（{names}），回退默认值",
                         version=flag_set.version)
     rule = matched[0]
     value = rule.value if rule.value is not None else flag.default
-    return Decision(flag=name, kind=DecisionKind.RULE_MATCH, value=value, rule=rule.name,
+    return Decision(flag=flag.name, kind=DecisionKind.RULE_MATCH, value=value, rule=rule.name,
                     reason=f"命中规则 {rule.name!r}", version=flag_set.version)
+
+
+def _is_active(decision: Decision) -> bool:
+    """判定是否为“生效”：命中规则或取默认值且值为真。关闭/缺失/被排除均不算。"""
+    return decision.kind in _ACTIVE_KINDS and bool(decision.value)
+
+
+def _evaluate_own(
+    flag_set: FlagSet,
+    name: str,
+    context: dict[str, Any],
+    own_memo: dict[str, Decision],
+    final_memo: dict[str, Decision],
+    in_progress: set[str],
+) -> Decision:
+    """开关自身的判定（缺失/关闭/依赖/规则），不做互斥组裁决。"""
+    if name in own_memo:
+        return own_memo[name]
+    flag = flag_set.flags.get(name)
+    if flag is None:
+        d = Decision(flag=name, kind=DecisionKind.FLAG_MISSING, value=None,
+                     reason=f"开关 {name!r} 不存在", version=flag_set.version)
+    elif not flag.enabled:
+        d = Decision(flag=name, kind=DecisionKind.FLAG_DISABLED, value=flag.default,
+                     reason="开关已关闭，返回默认值", version=flag_set.version)
+    else:
+        unsatisfied = None
+        for dep in sorted(set(flag.depends_on)):
+            dep_decision = _evaluate_final(flag_set, dep, context, own_memo, final_memo, in_progress)
+            if not _is_active(dep_decision):
+                unsatisfied = dep
+                break
+        if unsatisfied is not None:
+            d = Decision(flag=name, kind=DecisionKind.DEPENDENCY_UNSATISFIED, value=flag.default,
+                         reason=f"依赖的开关 {unsatisfied!r} 未生效，本开关强制不生效",
+                         version=flag_set.version)
+        else:
+            d = _evaluate_rules(flag_set, flag, context)
+    own_memo[name] = d
+    return d
+
+
+def _evaluate_final(
+    flag_set: FlagSet,
+    name: str,
+    context: dict[str, Any],
+    own_memo: dict[str, Decision],
+    final_memo: dict[str, Decision],
+    in_progress: set[str],
+) -> Decision:
+    """完整判定 = 自身判定 + 互斥组裁决（同组生效者中名字最小者胜出）。"""
+    if name in final_memo:
+        return final_memo[name]
+    if name in in_progress:
+        # 防御：发布前校验会拒绝依赖环，正常不会走到这里
+        return Decision(flag=name, kind=DecisionKind.DEPENDENCY_UNSATISFIED, value=None,
+                        reason="依赖关系成环", version=flag_set.version)
+    in_progress.add(name)
+    own = _evaluate_own(flag_set, name, context, own_memo, final_memo, in_progress)
+    decision = own
+    flag = flag_set.flags.get(name)
+    if flag is not None and flag.exclusive_group and _is_active(own):
+        members = flag_set.group_index.get(flag.exclusive_group, ())
+        active = [m for m in members
+                  if _is_active(_evaluate_own(flag_set, m, context, own_memo, final_memo, in_progress))]
+        winner = min(active) if active else name
+        if winner != name:
+            decision = Decision(
+                flag=name, kind=DecisionKind.GROUP_EXCLUDED, value=flag.default,
+                reason=f"互斥组 {flag.exclusive_group!r} 中 {winner!r} 生效，本开关被排除",
+                version=flag_set.version,
+            )
+    in_progress.discard(name)
+    final_memo[name] = decision
+    return decision
+
+
+def evaluate(flag_set: FlagSet, name: str, context: dict[str, Any]) -> Decision:
+    """对单个开关求值：规则按声明顺序匹配，结论与声明顺序、并发交错无关。"""
+    return _evaluate_final(flag_set, name, context, {}, {}, set())

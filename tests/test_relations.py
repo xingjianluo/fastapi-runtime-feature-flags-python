@@ -83,3 +83,99 @@ def test_diamond_dependency_ok():
     report = validate_relations(fs(*flags))
     log.info("菱形依赖 拒绝=%s", report.rejections)
     assert report.ok
+
+
+# ---------- 求值期语义 ----------
+
+from app.flags.evaluator import DecisionKind, evaluate  # noqa: E402
+
+
+def show(d, ctx):
+    log.info("输入 flag=%s context=%s -> 判定=%s 值=%r 原因=%s",
+             d.flag, ctx, d.kind.value, d.value, d.reason)
+    return d
+
+
+def test_dependency_satisfied_allows_evaluation():
+    flags = fs(bf("base", enabled=True, default=True),
+               bf("feature", depends_on=("base",), default=True))
+    d = show(evaluate(flags, "feature", {}), {})
+    assert d.kind is DecisionKind.DEFAULT and d.value is True
+
+
+def test_dependency_unsatisfied_forces_off():
+    flags = fs(bf("base", enabled=False, default=True),
+               bf("feature", depends_on=("base",), default=True))
+    d = show(evaluate(flags, "feature", {}), {})
+    assert d.kind is DecisionKind.DEPENDENCY_UNSATISFIED
+    assert "base" in d.reason
+
+
+def test_dependency_chain_transitive():
+    flags = fs(
+        bf("a", enabled=True, default=True),
+        bf("b", depends_on=("a",), default=True),
+        bf("c", depends_on=("b",), default=True),
+    )
+    assert evaluate(flags, "c", {}).value is True
+    # 关掉最底层，整条链都不生效
+    flags_off = fs(
+        bf("a", enabled=False, default=True),
+        bf("b", depends_on=("a",), default=True),
+        bf("c", depends_on=("b",), default=True),
+    )
+    d = show(evaluate(flags_off, "c", {}), {})
+    assert d.kind is DecisionKind.DEPENDENCY_UNSATISFIED
+
+
+def test_exclusive_group_winner_deterministic_regardless_of_order():
+    # 两个开关按规则都生效时，名字最小者胜出，与声明顺序无关
+    def build(order):
+        members = {
+            "beta": bf("beta", enabled=True, default=True, exclusive_group="g"),
+            "alpha": bf("alpha", enabled=True, default=True, exclusive_group="g"),
+        }
+        return fs(*(members[n] for n in order))
+
+    for order in (("alpha", "beta"), ("beta", "alpha")):
+        flags = build(order)
+        da = show(evaluate(flags, "alpha", {}), {})
+        db = show(evaluate(flags, "beta", {}), {})
+        assert da.kind is DecisionKind.DEFAULT and da.value is True  # alpha 胜出
+        # 被排除：kind 标记为 GROUP_EXCLUDED（不计入“生效”），值回退该开关默认值
+        assert db.kind is DecisionKind.GROUP_EXCLUDED
+        assert db.value == flags.flags["beta"].default
+        assert "alpha" in db.reason
+
+
+def test_exclusive_group_loser_off_allows_other():
+    flags = fs(
+        bf("alpha", enabled=False, default=True, exclusive_group="g"),
+        bf("beta", enabled=True, default=True, exclusive_group="g"),
+    )
+    d = show(evaluate(flags, "beta", {}), {})
+    assert d.kind is DecisionKind.DEFAULT and d.value is True
+
+
+def test_group_arbitration_uses_rule_evaluation():
+    # 组内成员按规则对不同用户生效，裁决仍确定
+    from app.flags.model import Condition, Operator, Rule
+    vip_rule = Rule("vip", conditions=(Condition("tier", Operator.EQ, "vip"),), value=True)
+    flags = fs(
+        bf("alpha", enabled=True, default=False, rules=(vip_rule,), exclusive_group="g"),
+        bf("beta", enabled=True, default=True, exclusive_group="g"),
+    )
+    ctx_vip = {"tier": "vip"}
+    da = show(evaluate(flags, "alpha", ctx_vip), ctx_vip)
+    db = show(evaluate(flags, "beta", ctx_vip), ctx_vip)
+    assert da.value is True and da.kind is DecisionKind.RULE_MATCH
+    assert db.kind is DecisionKind.GROUP_EXCLUDED
+    ctx_free = {"tier": "free"}
+    db2 = show(evaluate(flags, "beta", ctx_free), ctx_free)
+    assert db2.value is True  # alpha 对该用户不生效，beta 正常生效
+
+
+def test_no_relations_old_semantics_unchanged():
+    flags = fs(bf("plain", enabled=True, default=True))
+    d = evaluate(flags, "plain", {})
+    assert d.kind is DecisionKind.DEFAULT and d.value is True
